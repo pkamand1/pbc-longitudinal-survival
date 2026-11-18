@@ -1,0 +1,248 @@
+---
+title: "Longitudinal biomarkers and survival in primary biliary cholangitis: mixed-effects and Cox models of the Mayo Clinic trial"
+author: "Patricia K. Kamanda"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5,
+                      dpi = 120, fig.path = "results/figures/")
+suppressPackageStartupMessages({
+  library(survival)
+  library(lme4)
+  library(lmerTest)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(broom)
+  library(broom.mixed)
+})
+theme_set(theme_bw(base_size = 12))
+set.seed(20261117)
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+```
+
+## Background and questions
+
+Between 1974 and 1984 the Mayo Clinic conducted a double-blind, placebo-controlled trial of D-penicillamine in primary biliary cholangitis (PBC, formerly primary biliary cirrhosis), a chronic autoimmune disease of the small bile ducts in the liver. The trial data, with laboratory values recorded at every follow-up visit, are distributed with R's `survival` package as `pbc` (one row per patient) and `pbcseq` (one row per visit) and have become a standard teaching and methods data set (Fleming and Harrington, 1991; Therneau and Grambsch, 2000). This analysis asks:
+
+1. Did D-penicillamine slow the rise in serum bilirubin over time, the laboratory hallmark of progressive disease?
+2. Did D-penicillamine prolong survival?
+3. How strongly does bilirubin, measured at baseline and as it changes during follow-up, predict death?
+
+## Data
+
+```{r data}
+# Treatment is taken from pbc, where it is documented as 1 = D-penicillamine and 2 = placebo,
+# because the coding of trt in pbcseq has differed between versions of the survival package
+arm <- pbc |> filter(!is.na(trt)) |>
+  transmute(id, treatment = factor(trt, levels = c(2, 1), labels = c("Placebo", "D-penicillamine")))
+
+visits <- pbcseq |>
+  select(-trt) |>
+  inner_join(arm, by = "id") |>
+  mutate(sex       = factor(sex, levels = c("m", "f"), labels = c("Male", "Female")),
+         years     = day / 365.25,
+         log_bili  = log(bili),
+         died      = as.integer(status == 2))
+
+baseline <- visits |> filter(day == 0)
+c(patients = n_distinct(visits$id), visits = nrow(visits), baseline_rows = nrow(baseline))
+```
+
+Each of the `r n_distinct(visits$id)` randomized patients contributes a median of `r median(table(visits$id))` visits (range `r min(table(visits$id))` to `r max(table(visits$id))`) over a median follow-up of `r round(median(baseline$futime) / 365.25, 1)` years. The outcome status is coded as censored, transplanted, or dead; in the primary analyses liver transplantation is treated as censoring at the date of transplant, which is the convention in the original analyses, and a sensitivity analysis treats it as a competing event.
+
+### Baseline characteristics
+
+```{r table1}
+summarise_group <- function(d) {
+  tibble(
+    `Patients`                      = as.character(nrow(d)),
+    `Age, years, mean (SD)`         = sprintf("%.1f (%.1f)", mean(d$age), sd(d$age)),
+    `Female, n (%)`                 = sprintf("%d (%.0f%%)", sum(d$sex == "Female"), 100 * mean(d$sex == "Female")),
+    `Bilirubin, mg/dL, median (IQR)` = sprintf("%.1f (%.1f to %.1f)", median(d$bili), quantile(d$bili, 0.25), quantile(d$bili, 0.75)),
+    `Albumin, g/dL, mean (SD)`      = sprintf("%.2f (%.2f)", mean(d$albumin), sd(d$albumin)),
+    `Prothrombin time, s, mean (SD)` = sprintf("%.1f (%.1f)", mean(d$protime), sd(d$protime)),
+    `Edema present, n (%)`          = sprintf("%d (%.0f%%)", sum(d$edema > 0), 100 * mean(d$edema > 0)),
+    `Histologic stage 4, n (%)`     = sprintf("%d (%.0f%%)", sum(d$stage == 4, na.rm = TRUE), 100 * mean(d$stage == 4, na.rm = TRUE)),
+    `Deaths during follow-up, n (%)` = sprintf("%d (%.0f%%)", sum(d$status == 2), 100 * mean(d$status == 2)),
+    `Transplants, n (%)`            = sprintf("%d (%.0f%%)", sum(d$status == 1), 100 * mean(d$status == 1))
+  )
+}
+table1 <- bind_rows(
+  summarise_group(filter(baseline, treatment == "D-penicillamine")),
+  summarise_group(filter(baseline, treatment == "Placebo")),
+  summarise_group(baseline)
+) |>
+  mutate(group = c("D-penicillamine", "Placebo", "Overall")) |>
+  pivot_longer(-group, names_to = "Characteristic") |>
+  pivot_wider(names_from = group, values_from = value)
+write.csv(table1, "results/tables/table1_baseline.csv", row.names = FALSE)
+table1
+```
+
+Randomization produced broadly balanced groups; patients on D-penicillamine were on average about three years older, and age is adjusted for in every model. Bilirubin is strongly right-skewed, so it is analyzed on the log scale throughout.
+
+## Question 1: bilirubin trajectories
+
+```{r spaghetti, fig.cap = "Log bilirubin over follow-up for a random sample of 60 patients, with a smoothed mean for each arm."}
+sampled <- sample(unique(visits$id), 60)
+ggplot(visits, aes(years, log_bili, colour = treatment)) +
+  geom_line(data = filter(visits, id %in% sampled), aes(group = id), alpha = 0.35) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.2, span = 0.75) +
+  labs(x = "Years since randomization", y = "log bilirubin (mg/dL)", colour = NULL)
+```
+
+The linear mixed model has fixed effects for time, treatment, their interaction, age, and sex, and correlated random intercepts and slopes for each patient, so that every patient has an individual starting level and rate of change. Patients are measured at irregular times and drop out when they die or receive a transplant; a mixed model fitted by maximum likelihood remains valid when dropout depends on previously observed values, although not when it depends on unobserved ones.
+
+```{r lmm}
+fit_lmm <- lmer(log_bili ~ years * treatment + age + sex + (years | id), data = visits, REML = TRUE)
+lmm_table <- tidy(fit_lmm, effects = "fixed", conf.int = TRUE) |>
+  select(term, estimate, std.error, df, statistic, p.value, conf.low, conf.high)
+write.csv(lmm_table, "results/tables/lmm_log_bilirubin.csv", row.names = FALSE)
+lmm_table |> mutate(across(where(is.numeric), ~ round(.x, 4)))
+VarCorr(fit_lmm)
+```
+
+```{r lmm_summary, echo = FALSE}
+slope_placebo <- fixef(fit_lmm)[["years"]]
+slope_diff    <- lmm_table |> filter(term == "years:treatmentD-penicillamine")
+```
+
+On the placebo arm, log bilirubin rises by `r round(slope_placebo, 3)` per year, which is about `r round(100 * (exp(slope_placebo) - 1))`% per year on the original scale. The difference in slope on D-penicillamine is `r round(slope_diff$estimate, 3)` per year (95% CI `r round(slope_diff$conf.low, 3)` to `r round(slope_diff$conf.high, 3)`, p = `r fmt_p(slope_diff$p.value)`), so there is no evidence that the drug slowed the rise in bilirubin.
+
+```{r lmm_check, fig.cap = "Model checks: residuals against fitted values, and the distribution of estimated patient-specific slopes.", fig.height = 3.5, fig.width = 6}
+checks <- data.frame(fitted = fitted(fit_lmm), residual = resid(fit_lmm))
+p1 <- ggplot(checks, aes(fitted, residual)) + geom_point(alpha = 0.25, size = 0.8) +
+  geom_hline(yintercept = 0, colour = "red") + labs(x = "Fitted log bilirubin", y = "Residual")
+slopes <- coef(fit_lmm)$id |> mutate(slope = years)
+p2 <- ggplot(slopes, aes(slope)) + geom_histogram(bins = 30, fill = "#2471A3", colour = "white") +
+  labs(x = "Patient-specific slope (log bilirubin per year)", y = "Patients")
+print(p1)
+print(p2)
+```
+
+## Question 2: survival by treatment arm
+
+```{r km, fig.cap = "Kaplan-Meier estimates of survival free of death, with transplantation treated as censoring."}
+km <- survfit(Surv(futime / 365.25, died) ~ treatment, data = baseline)
+km_data <- tidy(km) |> mutate(strata = sub("treatment=", "", strata))
+ggplot(km_data, aes(time, estimate, colour = strata, fill = strata)) +
+  geom_step(linewidth = 0.9) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.12, colour = NA, stat = "identity") +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = "Years since randomization", y = "Survival", colour = NULL, fill = NULL)
+logrank <- survdiff(Surv(futime, died) ~ treatment, data = baseline)
+p_logrank <- pchisq(logrank$chisq, df = 1, lower.tail = FALSE)
+summary(km, times = c(5, 10))$table
+```
+
+The log-rank test gives p = `r fmt_p(p_logrank)`.
+
+```{r cox_trt}
+cox_trt <- coxph(Surv(futime, died) ~ treatment, data = baseline)
+cox_trt_tab <- tidy(cox_trt, exponentiate = TRUE, conf.int = TRUE)
+cox_trt_tab
+```
+
+The hazard ratio for death on D-penicillamine against placebo is `r round(cox_trt_tab$estimate, 2)` (95% CI `r round(cox_trt_tab$conf.low, 2)` to `r round(cox_trt_tab$conf.high, 2)`), in agreement with the trial's published conclusion that the drug conferred no survival benefit.
+
+## Question 3: bilirubin as a predictor of death
+
+### Baseline prognostic model
+
+The covariates are those of the Mayo risk score: age, log bilirubin, log albumin, log prothrombin time, and edema, with treatment retained as a design variable.
+
+```{r cox_baseline}
+cox_base <- coxph(Surv(futime, died) ~ treatment + age + log(bili) + log(albumin) + log(protime) + edema,
+                  data = baseline)
+cox_base_tab <- tidy(cox_base, exponentiate = TRUE, conf.int = TRUE) |>
+  select(term, estimate, conf.low, conf.high, p.value)
+write.csv(cox_base_tab, "results/tables/cox_baseline_mayo_covariates.csv", row.names = FALSE)
+cox_base_tab |> mutate(across(where(is.numeric), ~ signif(.x, 3)))
+c(concordance = unname(round(cox_base$concordance["concordance"], 3)))
+zph <- cox.zph(cox_base)
+zph
+```
+
+```{r cox_baseline_summary, echo = FALSE}
+hr_bili <- cox_base_tab |> filter(term == "log(bili)")
+```
+
+Each unit increase in log bilirubin, roughly a 2.7-fold rise in bilirubin, multiplies the hazard of death by `r round(hr_bili$estimate, 2)` (95% CI `r round(hr_bili$conf.low, 2)` to `r round(hr_bili$conf.high, 2)`) after adjustment for the other covariates. The concordance of the model is `r round(cox_base$concordance["concordance"], 2)`. The global test of proportional hazards gives p = `r fmt_p(zph$table["GLOBAL", "p"])`, so there is no strong evidence that the hazard ratios change over follow-up.
+
+### Time-dependent Cox model with updated bilirubin
+
+Baseline bilirubin uses only the first measurement. A time-dependent Cox model instead lets each patient's hazard at any moment depend on their most recent bilirubin, albumin, and prothrombin time. The data are restructured into counting-process form with `tmerge`, so that each interval between visits carries the values measured at its start.
+
+```{r cox_td}
+td <- tmerge(baseline |> select(id, futime, died, treatment, age, sex),
+             baseline |> select(id, futime, died),
+             id = id, death = event(futime, died))
+td <- tmerge(td, visits, id = id,
+             bili = tdc(day, bili), albumin = tdc(day, albumin), protime = tdc(day, protime),
+             edema = tdc(day, edema))
+c(intervals = nrow(td), patients = n_distinct(td$id), deaths = sum(td$death))
+
+cox_td <- coxph(Surv(tstart, tstop, death) ~ treatment + age + log(bili) + log(albumin) + log(protime) + edema,
+                data = td)
+cox_td_tab <- tidy(cox_td, exponentiate = TRUE, conf.int = TRUE) |>
+  select(term, estimate, conf.low, conf.high, p.value)
+write.csv(cox_td_tab, "results/tables/cox_time_dependent.csv", row.names = FALSE)
+cox_td_tab |> mutate(across(where(is.numeric), ~ signif(.x, 3)))
+c(concordance = unname(round(cox_td$concordance["concordance"], 3)))
+```
+
+```{r cox_td_summary, echo = FALSE}
+hr_bili_td <- cox_td_tab |> filter(term == "log(bili)")
+```
+
+With bilirubin updated at every visit, the hazard ratio per unit of log bilirubin is `r round(hr_bili_td$estimate, 2)` (95% CI `r round(hr_bili_td$conf.low, 2)` to `r round(hr_bili_td$conf.high, 2)`), and the concordance rises from `r round(cox_base$concordance["concordance"], 2)` to `r round(cox_td$concordance["concordance"], 2)`. A patient's current bilirubin is therefore a stronger guide to their immediate risk than the value recorded when they entered the trial.
+
+```{r hr_plot, fig.cap = "Hazard ratios from the baseline and time-dependent Cox models (log scale)."}
+hr_both <- bind_rows(mutate(cox_base_tab, model = "Baseline values"),
+                     mutate(cox_td_tab, model = "Updated at each visit")) |>
+  mutate(term = recode(term, "treatmentD-penicillamine" = "D-penicillamine vs placebo", "age" = "Age (per year)",
+                       "log(bili)" = "log bilirubin", "log(albumin)" = "log albumin",
+                       "log(protime)" = "log prothrombin time", "edema" = "Edema (0, 0.5, 1)"))
+ggplot(hr_both, aes(estimate, term, colour = model)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), position = position_dodge(width = 0.5)) +
+  scale_x_log10() + labs(x = "Hazard ratio (95% CI)", y = NULL, colour = NULL)
+```
+
+### Sensitivity analysis: transplantation as a competing event
+
+Treating transplant as censoring assumes that transplanted patients would have had the same subsequent risk of death as those who remained, which is unlikely, since transplant was offered to the sickest patients. Fine and Gray regression treats transplant instead as a competing event.
+
+```{r competing}
+baseline_cr <- baseline |> mutate(event = factor(status, levels = 0:2, labels = c("censored", "transplant", "death")))
+fg_data <- finegray(Surv(futime, event) ~ ., data = baseline_cr, etype = "death")
+fg <- coxph(Surv(fgstart, fgstop, fgstatus) ~ treatment + age + log(bili) + log(albumin) + log(protime) + edema,
+            data = fg_data, weights = fgwt)
+fg_tab <- tidy(fg, exponentiate = TRUE, conf.int = TRUE) |> select(term, estimate, conf.low, conf.high, p.value)
+write.csv(fg_tab, "results/tables/finegray_death.csv", row.names = FALSE)
+fg_tab |> mutate(across(where(is.numeric), ~ signif(.x, 3)))
+```
+
+The subdistribution hazard ratios are close to the cause-specific estimates, so the conclusions do not depend on how the `r sum(baseline$status == 1)` transplants are handled.
+
+## Conclusions
+
+In this trial D-penicillamine neither slowed the rise in bilirubin nor improved survival. Bilirubin was the dominant predictor of death, and modelling it as a time-varying quantity, rather than a single baseline value, gave a stronger and more clinically useful account of each patient's changing risk. The same toolkit (mixed models for irregularly measured biomarkers, Kaplan-Meier and Cox models for time to event, counting-process data for time-dependent covariates, and competing-risks sensitivity analyses) applies directly to observational cohorts built from electronic health records.
+
+## References
+
+Fleming, T. R., & Harrington, D. P. (1991). *Counting processes and survival analysis*. Wiley.
+
+Therneau, T. M., & Grambsch, P. M. (2000). *Modeling survival data: Extending the Cox model*. Springer.
+
+## Session information
+
+```{r session}
+sessionInfo()
+```
